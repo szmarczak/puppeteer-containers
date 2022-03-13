@@ -3,12 +3,12 @@ const path = require('path');
 const os = require('os');
 const fs = require('fs');
 const puppeteer = require('puppeteer');
-const pLimit = require('p-limit');
+const PQueue = require('p-queue').default;
 
 // Puppeteer is not fully supported due to https://github.com/puppeteer/puppeteer/issues/3667 (doesn't intercept targets such as window.open)
 // Playwright is not supported due to https://github.com/microsoft/playwright/issues/7220 (cache disabled if intercepting)
 
-const limit = pLimit(1);
+const queue = new PQueue({concurrency: 1});
 const container = fs.readFileSync('container.js', 'utf8');
 
 const containerReferences = new Map();
@@ -59,7 +59,37 @@ const newPage = async (context) => {
 		try {
 			// This needs to be limited because we can't intercept responses yet.
 			// See https://github.com/puppeteer/puppeteer/issues/1191
-			await limit(requestHandler, request);
+			await queue.add(() => requestHandler(request), {priority: 0});
+		} catch {
+			// Most likely the page was closed.
+		}
+	});
+
+	const responseHandler = async (response) => {
+		const cookies = await page.cookies();
+
+		const toDelete = [];
+		const toSet = [];
+
+		for (const cookie of newCookies) {
+			if (!cookie.name.startsWith(APIFY_CONTAINER)) {
+				toDelete.push(cookie);
+				toSet.push({...cookie, name: key + cookie.name});
+			}
+		}
+
+		await page.deleteCookie(...toDelete);
+		await page.setCookie(...toSet);
+	};
+
+	// There may be a race condition in puppeteer. Multiple `request` events get emitted before first `requestfinished`.
+	// Probably https://github.com/puppeteer/puppeteer/issues/1191 would fix this.
+	// Or I guess the limiter fixes this as well because I haven't come to reproduce this yet.
+	page.on('requestfinished', async (request) => {
+		const response = request.response();
+
+		try {
+			await queue.add(() => responseHandler(response), {priority: 1});
 		} catch {
 			// Most likely the page was closed.
 		}
@@ -109,4 +139,3 @@ const newPage = async (context) => {
 
 	const pages = await Promise.all([ open(), open() ]);
 })();
-
